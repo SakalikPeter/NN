@@ -46,11 +46,16 @@ def build_generator(latent_dim = 100):
 	# upsample to 8x8
 	model.add(Conv2DTranspose(128, (4,4), strides=(2,2), padding='same'))
 	model.add(LeakyReLU(alpha=config['lrelu']))
+	model.add(Conv2D(256, (3,3), padding='same'))
+	model.add(LeakyReLU(alpha=config['lrelu']))
 	# upsample to 16x16
 	model.add(Conv2DTranspose(128, (4,4), strides=(2,2), padding='same'))
 	model.add(LeakyReLU(alpha=config['lrelu']))
+	model.add(LeakyReLU(alpha=config['lrelu']))
 	# upsample to 32x32
 	model.add(Conv2DTranspose(128, (4,4), strides=(2,2), padding='same'))
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	model.add(Conv2D(256, (3,3), padding='same'))
 	model.add(LeakyReLU(alpha=config['lrelu']))
 	# output layer
 	model.add(Conv2D(3, (3,3), activation='tanh', padding='same'))
@@ -119,7 +124,7 @@ def summarize_performance(examples, n, iter):
 		pyplot.axis('off')
 		# plot raw pixel data
 		pyplot.imshow(examples[i])
-	pyplot.savefig(f'output_{iter}.png')
+	pyplot.savefig(f'output_file/output_{iter}.png')
 
 def summarize_accuracy(dataset, n_samples, d_model, g_model):
 	# prepare real samples
@@ -131,10 +136,10 @@ def summarize_accuracy(dataset, n_samples, d_model, g_model):
 	# evaluate discriminator on fake examples
 	_, acc_fake = d_model.evaluate(x_fake, y_fake, verbose=0)
 
-	wandb.log({
-		"Disc real Acc": acc_real,
-		"Disc fake Acc": acc_fake
-	})
+	# wandb.log({
+	# 	"Disc real Acc": acc_real,
+	# 	"Disc fake Acc": acc_fake
+	# })
 
 
 def train(g_model, d_model, gan_model, dataset, latent_dim, n_epochs=200, n_batch=128):
@@ -166,23 +171,23 @@ def train(g_model, d_model, gan_model, dataset, latent_dim, n_epochs=200, n_batc
 			X = (X + 1) / 2.0
 			summarize_performance(X, 3, i)
 
-		wandb.log({
-			"Epoch": i,
-			"real Loss": d_loss_real[0],
-			"fake Loss": d_loss_fake[0],
-			"Gen Loss": g_loss
-		})
+		# wandb.log({
+		# 	"Epoch": i,
+		# 	"real Loss": d_loss_real[0],
+		# 	"fake Loss": d_loss_fake[0],
+		# 	"Gen Loss": g_loss
+		# })
 
 
-wandb.login()
+# wandb.login()
 
 config = {
-    "epochs": 20,
-    "batch_size": 128,
+    "epochs": 100,
+    "batch_size": 256,
 	"input_shape1": (32,32,3),
 	"input_shape2": (32,32),
-	"smooth": 0,
-	"lrelu": 0.2,
+	"smooth": 0.1,
+	"lrelu": 0.02,
 	"dropout": 0.4,
 	"batch_norm": False,
     "loss_function": "binary_crossentropy",
@@ -196,8 +201,8 @@ config = {
 	"comment": ""
 }
 
-run = wandb.init(project='nsfitt-pa', entity='nsfitt-pa')
-wandb.config.update(config)
+# run = wandb.init(project='nsfitt-pa', entity='nsfitt-pa')
+# wandb.config.update(config)
 
 latent_dim = 100
 df = load_real_data()
@@ -210,10 +215,10 @@ gan_model = build_gan(g_model, d_model)
 
 train(g_model, d_model, gan_model, df, latent_dim, n_epochs=config['epochs'], n_batch=config['batch_size'])
 
-summarize_accuracy(df, config['batch_size'], d_model, g_model)
+# summarize_accuracy(df, config['batch_size'], d_model, g_model)
 
-latent_points = generate_latent_points(100, 1)
-X  = g_model.predict(latent_points)
-X = (X + 1) / 2.0
-wandb.log({"examples": [wandb.Image(X, caption="Output")]})
-run.finish()
+# latent_points = generate_latent_points(100, 1)
+# X  = g_model.predict(latent_points)
+# X = (X + 1) / 2.0
+# wandb.log({"examples": [wandb.Image(X, caption="Output")]})
+# run.finish()
