@@ -6,11 +6,11 @@ from numpy.random import randn
 from numpy import ones
 from matplotlib import pyplot
 import wandb
+import os
 
 from tensorflow.keras.models import Model
 from tensorflow.keras import Sequential
 from tensorflow.keras import backend
-from tensorflow.keras.constraints import Constraint
 from tensorflow.keras.optimizers import RMSprop
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.layers import Dense, LeakyReLU, Reshape, Conv2DTranspose, Conv2D, Flatten, BatchNormalization, UpSampling2D, Input, Activation
@@ -18,6 +18,9 @@ from tensorflow.keras.layers import Dense, LeakyReLU, Reshape, Conv2DTranspose, 
 physical_devices = tf.config.experimental.list_physical_devices('GPU')
 assert len(physical_devices) > 0, "Not enough GPU hardware devices available"
 config = tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
+sess = tf.compat.v1.Session()
+
 
 
 # ########################################
@@ -131,13 +134,14 @@ def define_generator(latent_dim):
 # ########################################
 # GAN
 # ########################################
-class WGAN(tf.keras.Model):
+class WGAN(Model):
 	def __init__(
 		self,
 		discriminator,
 		generator,
 		latent_dim,
 		dataset,
+		is_wandb,
 		batch_size,
 		discriminator_extra_steps=3,
 		gp_weight=10.0,
@@ -150,6 +154,10 @@ class WGAN(tf.keras.Model):
 		self.gp_weight = gp_weight
 		self.dataset = dataset
 		self.batch_size = batch_size
+		self.is_wandb = is_wandb
+		self.epochs = -1
+		self.c_loss = 0
+		self.g_loss = 0
 
 	def compile(self, d_optimizer, g_optimizer, d_loss_fn, g_loss_fn):
 		super(WGAN, self).compile()
@@ -182,8 +190,9 @@ class WGAN(tf.keras.Model):
 		return gp
 
 	def train_step(self, data):
+		self.epochs += 1
 
-		for i in range(self.d_steps):
+		for _ in range(self.d_steps):
 			# Get the latent vector
 			X_real = generate_real_samples(self.dataset, self.batch_size)
 			random_latent_vectors = tf.random.normal(
@@ -205,10 +214,10 @@ class WGAN(tf.keras.Model):
 				# Calculate the gradient penalty
 				gp = self.gradient_penalty(self.batch_size, X_real, fake_images)
 				# Add the gradient penalty to the original discriminator loss
-				d_loss = d_cost + gp * self.gp_weight
+				c_loss = d_cost + gp * self.gp_weight
 
 			# Get the gradients w.r.t the discriminator loss
-			d_gradient = tape.gradient(d_loss, self.discriminator.trainable_variables)
+			d_gradient = tape.gradient(c_loss, self.discriminator.trainable_variables)
 			# Update the weights of the discriminator using the discriminator optimizer
 			self.d_optimizer.apply_gradients(
 				zip(d_gradient, self.discriminator.trainable_variables)
@@ -234,13 +243,18 @@ class WGAN(tf.keras.Model):
 		self.g_optimizer.apply_gradients(
 			zip(gen_gradient, self.generator.trainable_variables)
 		)
-		return {"d_loss": d_loss, "g_loss": g_loss}
+
+		self.c_loss = c_loss
+		self.g_loss = g_loss
+
+		return {"c_loss": c_loss, "g_loss": g_loss}
 
 
 class GANMonitor(tf.keras.callbacks.Callback):
-	def __init__(self, num_img=16, latent_dim=128):
+	def __init__(self, wgan, num_img=16, latent_dim=128):
 		self.num_img = num_img
 		self.latent_dim = latent_dim
+		self.wgan = wgan
 
 	def on_epoch_end(self, epoch, logs=None):
 		n = int(self.num_img**(1/2))
@@ -282,7 +296,6 @@ def generate_real_samples(df, n_samples):
 
 
 def generate_latent_points(latent_dim, n_samples):
-	# x_input = randn(latent_dim*n_samples)
 	x_input = np.random.normal(0,1,latent_dim*n_samples)
 	z_input = x_input.reshape(n_samples, latent_dim)
 
@@ -314,28 +327,30 @@ def summarize_accuracy(dataset, n_samples, d_model, g_model):
                 
 
 
-is_wandb = False
+is_wandb = True
 size = 64
 
 
 config = {
-    "epochs": 10000,
+    "epochs": 3000,
     "batch_size": 64,
 	"input_shape1": (size,size,3),
 	"input_shape2": (size,size),
 	"smooth": 0,
 	"lrelu": 0.2,
-	"dropout": 0.4,
-	"batch_norm": False,
-    "loss_function": "binary_crossentropy",
-    "d_optimizer": "RMSprop",
-	"d_learning_rate": 0.0005,
-	"g_learning_rate": 0.0005,
+	"dropout": 0,
+	"batch_norm": True,
+    "loss_function": "wasserstein loss",
+    "d_optimizer": "Adam",
+	"g_optimizer": "Adam",
+	"d_learning_rate": 0.0002,
+	"g_learning_rate": 0.0002,
 	"d_beta1": 0.5,
 	"g_beta1": 0.5,
-	"g_optimizer": "RMSprop",
+	"d_beta2": 0.9,
+	"g_beta2": 0.9,
     "dataset": "Pokemon",
-	"comment": "Aplikovanie WGAN s batchnorm."
+	"comment": "Aplikovanie WGAN s batchnorm regularizaciou pred aktivacnou funkciou."
 }
 
 if is_wandb:
@@ -346,8 +361,6 @@ if is_wandb:
 latent_dim = 100
 df = load_real_data()
 
-cbk = GANMonitor(num_img=16, latent_dim=latent_dim)
-
 g_model = define_generator(latent_dim)
 print(g_model.summary())
 d_model = define_critic(config['input_shape1'])
@@ -357,10 +370,10 @@ print(d_model.summary())
 # Instantiate the optimizer for both networks
 # (learning_rate=0.0002, beta_1=0.5 are recommended)
 generator_optimizer = Adam(
-    learning_rate=0.0002, beta_1=0.5, beta_2=0.9
+    learning_rate=config['g_learning_rate'], beta_1=config['g_beta1'], beta_2=config['g_beta2']
 )
 discriminator_optimizer = Adam(
-    learning_rate=0.0002, beta_1=0.5, beta_2=0.9
+    learning_rate=config['d_learning_rate'], beta_1=config['d_beta1'], beta_2=config['d_beta2']
 )
 
 # Instantiate the WGAN model.
@@ -369,6 +382,7 @@ wgan = WGAN(
     generator=g_model,
     latent_dim=latent_dim,
 	dataset=df,
+	is_wandb=is_wandb,
 	batch_size=config['batch_size'],
     discriminator_extra_steps=3,
 )
@@ -380,8 +394,10 @@ wgan.compile(
     d_loss_fn=discriminator_loss,
 )
 
-wgan.fit(df, epochs=config['epochs'], callbacks=[cbk])
+cbk = GANMonitor(wgan, num_img=16, latent_dim=latent_dim)
+from wandb.keras import WandbCallback
+
+wgan.fit(df, epochs=config['epochs'], callbacks=[cbk, WandbCallback()])
 
 if is_wandb:
-	summarize_accuracy(df, config['batch_size'], d_model, g_model)
 	run.finish()
