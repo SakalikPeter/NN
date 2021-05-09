@@ -40,20 +40,27 @@ def generator_loss(fake_img):
 def define_critic(in_shape):
 	model = Sequential()
 	# downsample
-	model.add(Conv2D(64, (5,5), strides=(2,2), padding='same', input_shape=in_shape))
+	model.add(Conv2D(64, (4,4), strides=(2,2), padding='same', input_shape=in_shape))
 	model.add(LeakyReLU(alpha=config['lrelu']))
 	# downsample
-	model.add(Conv2D(128, (5,5), strides=(2,2), padding='same'))
+	model.add(Conv2D(128, (4,4), strides=(2,2), padding='same'))
 	model.add(BatchNormalization())
 	model.add(LeakyReLU(alpha=config['lrelu']))
 	# downsample
-	model.add(Conv2D(256, (5,5), strides=(2,2), padding='same'))
+	model.add(Conv2D(256, (4,4), strides=(2,2), padding='same'))
+	model.add(Conv2D(256, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(256, (3,3), strides=(1,1), padding="same"))
 	model.add(BatchNormalization())
 	model.add(LeakyReLU(alpha=config['lrelu']))
 	# downsample
 	model.add(Conv2D(512, (5,5), strides=(2,2), padding='same'))
 	model.add(BatchNormalization())
 	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(1, (1,1), strides=(1,1), padding="same"))
 	# classifier
 	model.add(Flatten())
 	model.add(Dense(1))
@@ -65,25 +72,59 @@ def define_critic(in_shape):
 def define_generator(latent_dim):
 	model = Sequential()
 	# foundation for 4x4 image
-	n_nodes = 512 * 4 * 4
+	n_nodes = 512 * 8 * 8
 	model.add(Dense(n_nodes, input_shape=(1,1,latent_dim)))
-	model.add(Reshape((4, 4, 512)))
-	model.add(BatchNormalization())
-	model.add(LeakyReLU(alpha=config['lrelu']))
-	# upsample to 8x8
-	model.add(Conv2DTranspose(256, (5,5), strides=(2,2), padding='same'))
-	model.add(BatchNormalization())
-	model.add(LeakyReLU(alpha=config['lrelu']))
+	model.add(Reshape((8, 8, 512)))	
+	
 	# upsample to 16x16
-	model.add(Conv2DTranspose(128, (5,5), strides=(2,2), padding='same'))
+	model.add(Conv2DTranspose(256, (4,4), strides=(2,2), padding='same'))
 	model.add(BatchNormalization())
 	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(256, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(256, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(256, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
 	# upsample to 32x32
-	model.add(Conv2DTranspose(64, (5,5), strides=(2,2), padding='same'))
+	model.add(Conv2DTranspose(128, (4,4), strides=(2,2), padding='same'))
 	model.add(BatchNormalization())
 	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(128, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(128, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
 	# upsample to 64x64
-	model.add(Conv2DTranspose(3, (5,5), strides=(2,2), padding='same', activation='tanh'))
+	model.add(Conv2DTranspose(64, (4,4), strides=(2,2), padding='same'))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(64, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(64, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	model.add(Conv2D(64, (3,3), strides=(1,1), padding="same"))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+
+	# upsample to 64x64
+	model.add(Conv2D(3, (3,3), strides=(1,1), padding='same', activation='tanh'))
 	return model
 
 
@@ -205,10 +246,9 @@ class GANMonitor(tf.keras.callbacks.Callback):
 		n = int(self.num_img**(1/2))
 		random_latent_vectors = tf.random.normal(shape=(self.num_img, self.latent_dim))
 		generated_images = self.model.generator(random_latent_vectors)
-		generated_images = (generated_images * 127.5) + 127.5
+		generated_images = (generated_images + 1) / 2.0
 
-		print('volam sa jano ', epoch)
-		if (epoch+1)% 5 == 0:
+		if (epoch+1)% 10 == 0:
 			for i in range(n * n):
 				# define subplot
 				pyplot.subplot(n, n, 1 + i)
@@ -306,7 +346,7 @@ if is_wandb:
 latent_dim = 100
 df = load_real_data()
 
-cbk = GANMonitor(num_img=3, latent_dim=latent_dim)
+cbk = GANMonitor(num_img=16, latent_dim=latent_dim)
 
 g_model = define_generator(latent_dim)
 print(g_model.summary())
