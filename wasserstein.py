@@ -3,154 +3,247 @@ import pandas as pd
 from PIL import Image
 import numpy as np
 from numpy.random import randn
-from numpy import zeros, ones
+from numpy import ones
 from matplotlib import pyplot
 import wandb
 
+from tensorflow.keras.models import Model
 from tensorflow.keras import Sequential
 from tensorflow.keras import backend
 from tensorflow.keras.constraints import Constraint
 from tensorflow.keras.optimizers import RMSprop
-from tensorflow.keras.layers import Dropout, Dense, LeakyReLU, Reshape, Conv2DTranspose, Conv2D, Flatten, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.layers import Dense, LeakyReLU, Reshape, Conv2DTranspose, Conv2D, Flatten, BatchNormalization, UpSampling2D, Input, Activation
 
 physical_devices = tf.config.experimental.list_physical_devices('GPU')
 assert len(physical_devices) > 0, "Not enough GPU hardware devices available"
 config = tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 
-# clip model weights to a given hypercube
-class ClipConstraint(Constraint):
-	# set clip value when initialized
-	def __init__(self, clip_value):
-		self.clip_value = clip_value
+# ########################################
+# LOSSES
+# ########################################
+def discriminator_loss(real_img, fake_img):
+    real_loss = tf.reduce_mean(real_img)
+    fake_loss = tf.reduce_mean(fake_img)
+    return fake_loss - real_loss
+
+
+# Define the loss functions for the generator.
+def generator_loss(fake_img):
+    return -tf.reduce_mean(fake_img)
+
+
+# ########################################
+# critic
+# ########################################
+def define_critic(in_shape):
+	model = Sequential()
+	# downsample
+	model.add(Conv2D(64, (5,5), strides=(2,2), padding='same', input_shape=in_shape))
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# downsample
+	model.add(Conv2D(128, (5,5), strides=(2,2), padding='same'))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# downsample
+	model.add(Conv2D(256, (5,5), strides=(2,2), padding='same'))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# downsample
+	model.add(Conv2D(512, (5,5), strides=(2,2), padding='same'))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# classifier
+	model.add(Flatten())
+	model.add(Dense(1))
+	return model
  
-	# clip model weights to hypercube
-	def __call__(self, weights):
-		return backend.clip(weights, -self.clip_value, self.clip_value)
- 
-	# get the config
-	def get_config(self):
-		return {'clip_value': self.clip_value}
+# ########################################
+# GENERATOR
+# ########################################
+def define_generator(latent_dim):
+	model = Sequential()
+	# foundation for 4x4 image
+	n_nodes = 512 * 4 * 4
+	model.add(Dense(n_nodes, input_shape=(1,1,latent_dim)))
+	model.add(Reshape((4, 4, 512)))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# upsample to 8x8
+	model.add(Conv2DTranspose(256, (5,5), strides=(2,2), padding='same'))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# upsample to 16x16
+	model.add(Conv2DTranspose(128, (5,5), strides=(2,2), padding='same'))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# upsample to 32x32
+	model.add(Conv2DTranspose(64, (5,5), strides=(2,2), padding='same'))
+	model.add(BatchNormalization())
+	model.add(LeakyReLU(alpha=config['lrelu']))
+	# upsample to 64x64
+	model.add(Conv2DTranspose(3, (5,5), strides=(2,2), padding='same', activation='tanh'))
+	return model
 
 
-# calculate wasserstein loss
-def wasserstein_loss(y_true, y_pred):
-	return backend.mean(y_true * y_pred)
+# ########################################
+# GAN
+# ########################################
+class WGAN(tf.keras.Model):
+	def __init__(
+		self,
+		discriminator,
+		generator,
+		latent_dim,
+		dataset,
+		batch_size,
+		discriminator_extra_steps=3,
+		gp_weight=10.0,
+	):
+		super(WGAN, self).__init__()
+		self.discriminator = discriminator
+		self.generator = generator
+		self.latent_dim = latent_dim
+		self.d_steps = discriminator_extra_steps
+		self.gp_weight = gp_weight
+		self.dataset = dataset
+		self.batch_size = batch_size
+
+	def compile(self, d_optimizer, g_optimizer, d_loss_fn, g_loss_fn):
+		super(WGAN, self).compile()
+		self.d_optimizer = d_optimizer
+		self.g_optimizer = g_optimizer
+		self.d_loss_fn = d_loss_fn
+		self.g_loss_fn = g_loss_fn
+
+	def gradient_penalty(self, batch_size, real_images, fake_images):
+		""" Calculates the gradient penalty.
+
+		This loss is calculated on an interpolated image
+		and added to the discriminator loss.
+		"""
+		# Get the interpolated image
+		alpha = tf.random.normal([batch_size, 1, 1, 1], 0.0, 1.0)
+		diff = fake_images - real_images
+		interpolated = real_images + alpha * diff
+
+		with tf.GradientTape() as gp_tape:
+			gp_tape.watch(interpolated)
+			# 1. Get the discriminator output for this interpolated image.
+			pred = self.discriminator(interpolated, training=True)
+
+		# 2. Calculate the gradients w.r.t to this interpolated image.
+		grads = gp_tape.gradient(pred, [interpolated])[0]
+		# 3. Calculate the norm of the gradients.
+		norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]))
+		gp = tf.reduce_mean((norm - 1.0) ** 2)
+		return gp
+
+	def train_step(self, data):
+
+		for i in range(self.d_steps):
+			# Get the latent vector
+			X_real = generate_real_samples(self.dataset, self.batch_size)
+			random_latent_vectors = tf.random.normal(
+				shape=(self.batch_size, self.latent_dim)
+			)
+			# X_fake = generate_fake_samples(g_model, self.latent_dim, half_batch)
+			
+
+			with tf.GradientTape() as tape:
+				# Generate fake images from the latent vector
+				fake_images = self.generator(random_latent_vectors, training=True)
+				# Get the logits for the fake images
+				fake_logits = self.discriminator(fake_images, training=True)
+				# Get the logits for the real images
+				real_logits = self.discriminator(X_real, training=True)
+
+				# Calculate the discriminator loss using the fake and real image logits
+				d_cost = self.d_loss_fn(real_img=real_logits, fake_img=fake_logits)
+				# Calculate the gradient penalty
+				gp = self.gradient_penalty(self.batch_size, X_real, fake_images)
+				# Add the gradient penalty to the original discriminator loss
+				d_loss = d_cost + gp * self.gp_weight
+
+			# Get the gradients w.r.t the discriminator loss
+			d_gradient = tape.gradient(d_loss, self.discriminator.trainable_variables)
+			# Update the weights of the discriminator using the discriminator optimizer
+			self.d_optimizer.apply_gradients(
+				zip(d_gradient, self.discriminator.trainable_variables)
+			)
+		
+		# Train the generator
+		# Get the latent vector
+		random_latent_vectors = tf.random.normal(
+			shape=(self.batch_size, self.latent_dim)
+		)
+		# X_fake = generate_fake_samples(g_model, self.latent_dim, self.batch_size)
+		with tf.GradientTape() as tape:
+			# Generate fake images using the generator
+			generated_images = self.generator(random_latent_vectors, training=True)
+			# Get the discriminator logits for fake images
+			gen_img_logits = self.discriminator(generated_images, training=True)
+			# Calculate the generator loss
+			g_loss = self.g_loss_fn(gen_img_logits)
+
+		# Get the gradients w.r.t the generator loss
+		gen_gradient = tape.gradient(g_loss, self.generator.trainable_variables)
+		# Update the weights of the generator using the generator optimizer
+		self.g_optimizer.apply_gradients(
+			zip(gen_gradient, self.generator.trainable_variables)
+		)
+		return {"d_loss": d_loss, "g_loss": g_loss}
 
 
-def build_discriminator(in_shape):
-    const = ClipConstraint(0.01)
+class GANMonitor(tf.keras.callbacks.Callback):
+	def __init__(self, num_img=16, latent_dim=128):
+		self.num_img = num_img
+		self.latent_dim = latent_dim
 
-    model = Sequential()
-    # normal
-    model.add(Conv2D(32, (3,3), padding='same', kernel_constraint=const, input_shape=in_shape))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # downsample
-    model.add(Conv2D(32, (3,3), strides=(2,2), padding='same', kernel_constraint=const))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # downsample
-    model.add(Conv2D(64, (3,3), strides=(2,2), padding='same', kernel_constraint=const))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # downsample
-    model.add(Conv2D(64, (3,3), strides=(2,2), padding='same', kernel_constraint=const))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # downsample
-    model.add(Conv2D(128, (3,3), strides=(2,2), padding='same', kernel_constraint=const))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # downsample
-    model.add(Conv2D(128, (3,3), strides=(2,2), padding='same', kernel_constraint=const))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # classifier
-    model.add(Flatten())
-    model.add(Dropout(config['dropout']))
-    model.add(Dense(1))
-    # compile model
-    opt = RMSprop(lr=config['d_learning_rate'])
-    model.compile(loss=wasserstein_loss, optimizer=opt, metrics=['accuracy'])
-    return model
+	def on_epoch_end(self, epoch, logs=None):
+		n = int(self.num_img**(1/2))
+		random_latent_vectors = tf.random.normal(shape=(self.num_img, self.latent_dim))
+		generated_images = self.model.generator(random_latent_vectors)
+		generated_images = (generated_images * 127.5) + 127.5
 
-
-def build_generator(latent_dim = 100):
-    model = Sequential()
-    # foundation for 4x4 image
-    n_nodes = 256 * 4 * 4
-    model.add(Dense(n_nodes, input_dim=latent_dim))
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    model.add(Reshape((4, 4, 256)))
-    # upsample to 8x8
-    model.add(Conv2DTranspose(128, (4,4), strides=(2,2), padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # upsample to 16x16
-    model.add(Conv2DTranspose(128, (4,4), strides=(2,2), padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # upsample to 32x32
-    model.add(Conv2DTranspose(128, (4,4), strides=(2,2), padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # upsample to 64x64
-    model.add(Conv2DTranspose(64, (4,4), strides=(2,2), padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-    # upsample to 128x128
-    model.add(Conv2DTranspose(64, (4,4), strides=(2,2), padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-
-    model.add(Conv2D(32, (3,3), strides=(1,1), padding='same'))
-    model.add(BatchNormalization())
-    model.add(LeakyReLU(alpha=config['lrelu']))
-	# output layer
-    model.add(Conv2D(3, (3,3), activation='tanh', padding='same'))
-    return model
-
-
-def build_gan(g_model, d_model):
-    d_model.trainable = False
-
-    model = Sequential()
-    model.add(g_model)
-    model.add(d_model)
-
-    opt = RMSprop(learning_rate=config['g_learning_rate'])
-    model.compile(loss=wasserstein_loss, optimizer=opt)
-    return model
-
+		print('volam sa jano ', epoch)
+		if (epoch+1)% 5 == 0:
+			for i in range(n * n):
+				# define subplot
+				pyplot.subplot(n, n, 1 + i)
+				# turn off axis
+				pyplot.axis('off')
+				# plot raw pixel data
+				pyplot.imshow(generated_images[i])
+			pyplot.savefig(f'output_file/output_{epoch+1}.png')
 
 def load_real_data():
     folder = 'data/pokemon/image_names.csv'
     df = pd.read_csv(folder, header=None)
-
     return df
 
 
-def generate_real_samples(df, iter, n_samples):
-    batch = df.sample(n_samples)
-    im_array = []
+def generate_real_samples(df, n_samples):
+	batch = df.sample(n_samples)
+	im_array = []
 
-    for _, row in batch.iterrows():
-        path = row[0]
-        im = Image.open('data/pokemon/'+path)
-        im = im.resize(config['input_shape2'])
-        im_array.append(np.array(im))
+	for _, row in batch.iterrows():
+		path = row[0]
+		im = Image.open('data/pokemon/'+path)
+		im = im.resize(config['input_shape2'])
+		im_array.append(np.array(im))
 
-    im_array = np.array(np.float32(im_array))
-    im_array = (im_array - 127.5) / 127.5
+	im_array = np.array(np.float32(im_array))
+	im_array = (im_array - 127.5) / 127.5
+	im_array = backend.constant(im_array)
 
-    y = -ones((n_samples, 1)) - config['smooth']
-
-    return im_array, y
+	return im_array
 
 
 def generate_latent_points(latent_dim, n_samples):
-	x_input = randn(latent_dim*n_samples)
+	# x_input = randn(latent_dim*n_samples)
+	x_input = np.random.normal(0,1,latent_dim*n_samples)
 	z_input = x_input.reshape(n_samples, latent_dim)
 
 	return z_input
@@ -159,92 +252,35 @@ def generate_latent_points(latent_dim, n_samples):
 def generate_fake_samples(generator, latent_dim, n_samples):
 	z_input = generate_latent_points(latent_dim, n_samples)
 	images = generator.predict(z_input)
-	y = ones((n_samples, 1))
 
-	return images, y
+	return images
 
 
-# generate samples and save as a plot and save the model
-def summarize_performance(examples, n, iter):
-	# plot images
-	for i in range(n * n):
-		# define subplot
-		pyplot.subplot(n, n, 1 + i)
-		# turn off axis
-		pyplot.axis('off')
-		# plot raw pixel data
-		pyplot.imshow(examples[i])
-	pyplot.savefig(f'output_file/output_{iter}.png')
 
 def summarize_accuracy(dataset, n_samples, d_model, g_model):
-	# prepare real samples
-	X_real, y_real = generate_real_samples(dataset, 0, n_samples)
-	# evaluate discriminator on real examples
-	_, acc_real = d_model.evaluate(X_real, y_real, verbose=0)
-	# prepare fake examples
+	X_real, y_real = generate_real_samples(dataset, n_samples)
+	acc_real = d_model.evaluate(X_real, y_real, verbose=0)
+
 	x_fake, y_fake = generate_fake_samples(g_model, latent_dim, n_samples)
-	# evaluate discriminator on fake examples
-	_, acc_fake = d_model.evaluate(x_fake, y_fake, verbose=0)
+	acc_fake = d_model.evaluate(x_fake, y_fake, verbose=0)
+
+	print(acc_real, acc_fake)
 
 	if is_wandb:
 		wandb.log({
 			"Disc real Acc": acc_real,
 			"Disc fake Acc": acc_fake
 		})
+                
 
 
-def train(g_model, d_model, gan_model, dataset, latent_dim, n_epochs=200, n_batch=128):
-    batch_per_epoch = int(dataset[0].shape[0] / n_batch)
-    half_batch = int(n_batch / 2)
-    d_loss_real = 0
-    d_loss_fake = 0
-    g_loss = 0
+is_wandb = False
+size = 64
 
-    # manually enumerate epochs
-    for i in range(n_epochs):
-        for j in range(int(batch_per_epoch)):
-            for _ in range(5):
-                X_real, y_real = generate_real_samples(dataset, j, half_batch)
-                X_fake, y_fake = generate_fake_samples(g_model, latent_dim, half_batch)
-
-                d_loss_real = d_model.train_on_batch(X_real, y_real)
-                d_loss_fake = d_model.train_on_batch(X_fake, y_fake)
-
-            z_input = generate_latent_points(latent_dim, n_batch)
-            y_gan = -ones((n_batch, 1))
-
-            g_loss = gan_model.train_on_batch(z_input, y_gan)
-
-            print('>%d, %d/%d, d1=%.3f, d2=%.3f g=%.3f' % (i+1, j+1, batch_per_epoch, d_loss_real[0], d_loss_fake[0], g_loss))
-
-        if (i+1) % (20) == 0:
-            latent_points = generate_latent_points(100, 9)
-            X  = g_model.predict(latent_points)
-            X = (X + 1) / 2.0
-            summarize_performance(X, 3, i)
-
-
-        if (i+1) % (100) == 0:
-            wandb.log({f"example_{i+1}": wandb.Image(f"output_file/output_{i}.png")})
-
-        if is_wandb:
-            wandb.log({
-                "Epoch": i,
-                "real Loss": d_loss_real[0],
-                "fake Loss": d_loss_fake[0],
-                "Gen Loss": g_loss
-            })
-
-
-is_wandb = True
-size = 128
-
-if is_wandb:
-	wandb.login()
 
 config = {
     "epochs": 10000,
-    "batch_size": 128,
+    "batch_size": 64,
 	"input_shape1": (size,size,3),
 	"input_shape2": (size,size),
 	"smooth": 0,
@@ -253,8 +289,8 @@ config = {
 	"batch_norm": False,
     "loss_function": "binary_crossentropy",
     "d_optimizer": "RMSprop",
-	"d_learning_rate": 0.00005,
-	"g_learning_rate": 0.00005,
+	"d_learning_rate": 0.0005,
+	"g_learning_rate": 0.0005,
 	"d_beta1": 0.5,
 	"g_beta1": 0.5,
 	"g_optimizer": "RMSprop",
@@ -263,24 +299,49 @@ config = {
 }
 
 if is_wandb:
+	wandb.login()
 	run = wandb.init(project='zadanie3', entity='nsfitt-pa')
 	wandb.config.update(config)
 
 latent_dim = 100
 df = load_real_data()
 
-g_model = build_generator()
-print(g_model.summary())
-d_model = build_discriminator(config['input_shape1'])
-print(d_model.summary())
-gan_model = build_gan(g_model, d_model)
+cbk = GANMonitor(num_img=3, latent_dim=latent_dim)
 
-train(g_model, d_model, gan_model, df, latent_dim, n_epochs=config['epochs'], n_batch=config['batch_size'])
+g_model = define_generator(latent_dim)
+print(g_model.summary())
+d_model = define_critic(config['input_shape1'])
+print(d_model.summary())
+# g_model, d_model = define_gan(g_model, d_model, latent_dim)
+
+# Instantiate the optimizer for both networks
+# (learning_rate=0.0002, beta_1=0.5 are recommended)
+generator_optimizer = Adam(
+    learning_rate=0.0002, beta_1=0.5, beta_2=0.9
+)
+discriminator_optimizer = Adam(
+    learning_rate=0.0002, beta_1=0.5, beta_2=0.9
+)
+
+# Instantiate the WGAN model.
+wgan = WGAN(
+    discriminator=d_model,
+    generator=g_model,
+    latent_dim=latent_dim,
+	dataset=df,
+	batch_size=config['batch_size'],
+    discriminator_extra_steps=3,
+)
+
+wgan.compile(
+    d_optimizer=discriminator_optimizer,
+    g_optimizer=generator_optimizer,
+    g_loss_fn=generator_loss,
+    d_loss_fn=discriminator_loss,
+)
+
+wgan.fit(df, epochs=config['epochs'], callbacks=[cbk])
 
 if is_wandb:
 	summarize_accuracy(df, config['batch_size'], d_model, g_model)
-
-	# latent_points = generate_latent_points(100, 1)
-	# X  = g_model.predict(latent_points)
-	# X = (X + 1) / 2.0
 	run.finish()
